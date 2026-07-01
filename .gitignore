@@ -27,7 +27,7 @@ build/
 # BloodHound output — may contain AD data
 *.zip
 *.json
-output/
+/output/
 *.log
 
 # Credentials / secrets
