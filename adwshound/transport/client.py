@@ -1,5 +1,6 @@
 import re
 import logging
+import threading
 from base64 import b64decode
 from uuid import UUID, uuid4
 from xml.etree import ElementTree
@@ -327,6 +328,11 @@ class ADWSClient:
         # queries (one NTLM/Kerberos handshake per run instead of one per query).
         self.reuse = reuse
         self._pull_conn: _ExtendedADWSConnect | None = None
+        # Serialises access to the shared reused connection: remote collectors
+        # issue ADWS sub-queries (SID/hostname lookups) from worker threads, and
+        # one NBFS/NNS stream can't be read/written concurrently (garbage
+        # NMFUnknownRecord / broken pipe otherwise).
+        self._pull_lock = threading.Lock()
         # Lazily-loaded set of valid schema attribute names (for fault recovery)
         self._valid_attrs: set[str] | None = None
 
@@ -376,14 +382,17 @@ class ADWSClient:
         """Send one enumeration; rebuild the reused connection once on transport error."""
         if not self.reuse:
             return self._new_pull_conn().pull_with_base(flt, attributes, base_dn)
-        try:
-            return self._get_pull_conn().pull_with_base(flt, attributes, base_dn)
-        except EnumerateFaultError:
-            raise  # server-side query fault, not a transport problem — don't rebuild
-        except Exception as exc:
-            log.warning("Reused ADWS connection failed (%s); rebuilding and retrying once", exc)
-            self._drop_pull_conn()
-            return self._get_pull_conn().pull_with_base(flt, attributes, base_dn)
+        # Hold the lock across the whole exchange (enumerate + pulls + any
+        # rebuild) so concurrent callers never share the single NBFS stream.
+        with self._pull_lock:
+            try:
+                return self._get_pull_conn().pull_with_base(flt, attributes, base_dn)
+            except EnumerateFaultError:
+                raise  # server-side query fault, not a transport problem — don't rebuild
+            except Exception as exc:
+                log.warning("Reused ADWS connection failed (%s); rebuilding and retrying once", exc)
+                self._drop_pull_conn()
+                return self._get_pull_conn().pull_with_base(flt, attributes, base_dn)
 
     def _pull(self, ldap_filter: str, attributes: list[str], base_dn: str):
         """Run one enumeration.
